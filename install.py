@@ -12,7 +12,7 @@ class TimescaleDBInstaller(ExtensionInstaller):
         super(TimescaleDBInstaller, self).__init__(
             version="0.1",
             name='tsdb',
-            description='Capture data from rtl_433',
+            description='Synchronize data from sqlite weewx.sdb to postgres/TimescaleDB',
             author="Timo Kleger",
             author_email="",
             files=[('bin/user', ['bin/user/tsdb.py'])]
