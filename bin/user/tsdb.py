@@ -146,7 +146,9 @@ class TimescaleDBSync(StdService):
         """Synchronize daily archives from WeeWX to TimescaleDB."""
         for measurements in self.daily_archive_tables:
             try:
-                self.weewx_conn = sqlite3.connect(self.engine.db_binder.db_name)
+                db = self.config_dict['DataBindings']['wx_binding']['database']
+                db_path = f"/var/lib/weewx/{self.config_dict['Databases'][db]['database_name']}"
+                self.weewx_conn = sqlite3.connect(db_path)
                 cursor = self.weewx_conn.cursor()
                 cursor.execute(f"SELECT * FROM {measurements} WHERE synced IS NULL OR synced = 0 ORDER BY dateTime ASC")
                 rows = cursor.fetchall()
