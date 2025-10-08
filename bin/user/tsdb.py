@@ -8,6 +8,7 @@ import sqlite3
 import psycopg2
 import logging
 import time
+import os
 
 VERSION = "0.1"
 WEEWX_VERSION = "4"
@@ -23,6 +24,9 @@ class TimescaleDBSync(StdService):
     """A WeeWX service that syncs archive records to a TimescaleDB database."""
 
     def __init__(self, engine, config_dict):
+        # Keep the config dict for later use
+        self.config_dict = config_dict
+
         # Store daily archive tables as an instance variable
         self.daily_archive_tables = [
             "archive_day_altimeter", "archive_day_appTemp1", "archive_day_barometer",
@@ -32,28 +36,16 @@ class TimescaleDBSync(StdService):
             "archive_day_rainRate", "archive_day_windChill", "archive_day_windDir", "archive_day_windGust",
             "archive_day_windGustDir", "archive_day_windRun", "archive_day_windSpeed"
         ]
-        # Ensure 'synced' column exists in archive and daily tables
         try:
             db = config_dict['DataBindings']['wx_binding']['database']
             db_path = f"/var/lib/weewx/{config_dict['Databases'][db]['database_name']}"
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(archive)")
-            columns = [row[1] for row in cursor.fetchall()]
-            if 'synced' not in columns:
-                cursor.execute("ALTER TABLE archive ADD COLUMN synced INTEGER DEFAULT 0")
-                conn.commit()
-            # Add 'synced' column to daily tables if missing
-            for table in self.daily_archive_tables:
-                cursor.execute(f"PRAGMA table_info({table})")
-                columns = [row[1] for row in cursor.fetchall()]
-                if 'synced' not in columns:
-                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN synced INTEGER DEFAULT 0")
-                    conn.commit()
-            conn.close()
+            self.weewx_db_path = db_path
+            # Create a separate sync DB alongside the WeeWX DB
+            self.sync_db_path = f"/var/lib/weewx/syncTsdb.sdb"
+            # Ensure sync DB and tables exist
+            self._ensure_sync_db()
         except Exception as e:
-            log.error(f"Error ensuring 'synced' column exists: {e}")
-            print(f"Error ensuring 'synced' column exists: {e}")
+            log.error(f"Error preparing sync DB: {e}")
         super().__init__(engine, config_dict)
         
         # Get configuration
@@ -73,11 +65,9 @@ class TimescaleDBSync(StdService):
             }
         except KeyError as e:
             log.info(f"Missing TimescaleDB configuration: %s", e)
-            print(f"Missing TimescaleDB configuration: {e}")
         else:
             self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
             log.info("TimescaleDB database: %s", self.database)
-            print(f"TimescaleDB database: {self.database}")
 
     def new_archive_record(self, event):
         """Gets called on a new archive record event."""
@@ -89,37 +79,61 @@ class TimescaleDBSync(StdService):
             self._insert_tsdb("archive", record)
         except Exception as e:
             log.error(f"Error connecting and synchronizing to TimescaleDB: %s", e)
-            print(f"Error connecting and synchronizing to TimescaleDB: {e}")
         finally:
             if hasattr(self, 'tsdb_conn'):
                 self.tsdb_conn.close()
-
-        # Check for older records in the wewx database that haven't been synchronized yet
+        # Mark this new record as synced in the sync DB
         try:
-            db = self.config_dict['DataBindings']['wx_binding']['database']
-            db_path = f"/var/lib/weewx/{self.config_dict['Databases'][db]['database_name']}"
-            self.weewx_conn = sqlite3.connect(db_path)            
+            sconn = sqlite3.connect(self.sync_db_path)
+            scur = sconn.cursor()
+            scur.execute("INSERT OR REPLACE INTO synced_archive (dateTime, synced) VALUES (?, 1)", (record.get('dateTime'),))
+            sconn.commit()
+            scur.close()
+            sconn.close()
+        except Exception as e:
+            log.error("Failed to mark archive record as synced in sync DB: %s", e)
+
+        # Check for older records in the weewx database that haven't been synchronized yet
+        try:
+            # Build a set of dateTimes already synced
+            sconn = sqlite3.connect(self.sync_db_path)
+            scur = sconn.cursor()
+            scur.execute("SELECT dateTime FROM synced_archive WHERE synced = 1")
+            synced_set = set(r[0] for r in scur.fetchall())
+            scur.close()
+            sconn.close()
+
+            self.weewx_conn = sqlite3.connect(self.weewx_db_path)
             cursor = self.weewx_conn.cursor()
-            cursor.execute("SELECT * FROM archive WHERE synced IS NULL OR synced = 0 ORDER BY dateTime ASC")
+            cursor.execute("SELECT * FROM archive ORDER BY dateTime ASC")
             rows = cursor.fetchall()
             columns = [description[0] for description in cursor.description]
             for row in rows:
+                dt = row[columns.index('dateTime')]
+                if dt in synced_set:
+                    continue
                 old_record = dict(zip(columns, row))
-                self.tsdb_conn = psycopg2.connect(**self.tsdb_config)
-                self._insert_tsdb("archive", old_record)
-                # Mark as synced
-                cursor.execute("UPDATE archive SET synced = 1 WHERE dateTime = ?", (old_record['dateTime'],))
-                self.weewx_conn.commit()
+                try:
+                    self.tsdb_conn = psycopg2.connect(**self.tsdb_config)
+                    self._insert_tsdb("archive", old_record)
+                finally:
+                    if hasattr(self, 'tsdb_conn'):
+                        self.tsdb_conn.close()
+                # Mark as synced in sync DB
+                sconn = sqlite3.connect(self.sync_db_path)
+                scur = sconn.cursor()
+                scur.execute("INSERT OR REPLACE INTO synced_archive (dateTime, synced) VALUES (?, 1)", (dt,))
+                sconn.commit()
+                scur.close()
+                sconn.close()
         except Exception as e:
             log.error(f"Error synchronizing old records: %s", e)
-            print(f"Error synchronizing old records: {e}")
         finally:
             if hasattr(self, 'weewx_conn'):
                 self.weewx_conn.close()
-            if hasattr(self, 'tsdb_conn'):
-                self.tsdb_conn.close()
 
         # Check daily archives if enabled
+        log.info(f"Daily archive sync is {'enabled' if self.enable_daily_sync else 'disabled'}.")
         if self.enable_daily_sync:
             self._sync_daily_archives()
 
@@ -131,14 +145,17 @@ class TimescaleDBSync(StdService):
             col_defs = ', '.join([f'{col} DOUBLE PRECISION' if col != 'dateTime' else 'dateTime INTEGER PRIMARY KEY' for col in record.keys()])
             create_sql = f"CREATE TABLE IF NOT EXISTS {table} ({col_defs})"
             cur.execute(create_sql)
+            self.tsdb_conn.commit()
 
             columns = ','.join(record.keys())
             placeholders = ','.join(['%s'] * len(record))
             values = tuple(record.values())
-            cur.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", values)
+            insert_sql = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
+            cur.execute(insert_sql, values)
+            self.tsdb_conn.commit()
+            log.info(f"Inserting / creating data with to TimescaleDB {table} time {record.get('dateTime')}")
         except Exception as e:
             log.error("Error inserting record into TimescaleDB: %s", e)
-            print(f"Error inserting record into TimescaleDB: {e}")
         finally:
             cur.close()
 
@@ -146,20 +163,37 @@ class TimescaleDBSync(StdService):
         """Synchronize daily archives from WeeWX to TimescaleDB."""
         for measurements in self.daily_archive_tables:
             try:
-                db = self.config_dict['DataBindings']['wx_binding']['database']
-                db_path = f"/var/lib/weewx/{self.config_dict['Databases'][db]['database_name']}"
-                self.weewx_conn = sqlite3.connect(db_path)
+                # For daily archives we keep a shared sync table (synced_archive_day)
+                sconn = sqlite3.connect(self.sync_db_path)
+                scur = sconn.cursor()
+                scur.execute("SELECT dateTime FROM synced_archive_day WHERE synced = 1")
+                synced_days = set(r[0] for r in scur.fetchall())
+                scur.close()
+                sconn.close()
+
+                self.weewx_conn = sqlite3.connect(self.weewx_db_path)
                 cursor = self.weewx_conn.cursor()
-                cursor.execute(f"SELECT * FROM {measurements} WHERE synced IS NULL OR synced = 0 ORDER BY dateTime ASC")
+                cursor.execute(f"SELECT * FROM {measurements} ORDER BY dateTime ASC")
                 rows = cursor.fetchall()
                 columns = [description[0] for description in cursor.description]
                 for row in rows:
+                    dt = row[columns.index('dateTime')]
+                    if dt in synced_days:
+                        continue
                     daily_record = dict(zip(columns, row))
-                    self.tsdb_conn = psycopg2.connect(**self.tsdb_config)
-                    self._insert_tsdb(measurements, daily_record)
-                    # Mark as synced
-                    cursor.execute(f"UPDATE {measurements} SET synced = 1 WHERE dateTime = ?", (daily_record['dateTime'],))
-                    self.weewx_conn.commit()
+                    try:
+                        self.tsdb_conn = psycopg2.connect(**self.tsdb_config)
+                        self._insert_tsdb(measurements, daily_record)
+                    finally:
+                        if hasattr(self, 'tsdb_conn'):
+                            self.tsdb_conn.close()
+                    # Mark day as synced (this marks the dateTime for all daily tables)
+                    sconn = sqlite3.connect(self.sync_db_path)
+                    scur = sconn.cursor()
+                    scur.execute("INSERT OR REPLACE INTO synced_archive_day (dateTime, synced) VALUES (?, 1)", (dt,))
+                    sconn.commit()
+                    scur.close()
+                    sconn.close()
             except Exception as e:
                 log.error(f"Error synchronizing daily archives from {measurements}: {e}")
             finally:
@@ -167,6 +201,36 @@ class TimescaleDBSync(StdService):
                     self.weewx_conn.close()
                 if hasattr(self, 'tsdb_conn'):
                     self.tsdb_conn.close()
+
+    def _ensure_sync_db(self):
+        """Create the sync DB file and required tables if they do not exist."""
+        try:
+            # Ensure directory exists
+            db_dir = os.path.dirname(self.sync_db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+            conn = sqlite3.connect(self.sync_db_path)
+            cur = conn.cursor()
+            # Two tables: synced_archive for main archive, synced_archive_day for daily archives
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS synced_archive (
+                    dateTime INTEGER PRIMARY KEY,
+                    synced INTEGER DEFAULT 0
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS synced_archive_day (
+                    dateTime INTEGER PRIMARY KEY,
+                    synced INTEGER DEFAULT 0
+                )
+            """)
+            conn.commit()
+            cur.close()
+            conn.close()
+            log.info("Sync DB ensured at %s", self.sync_db_path)
+        except Exception as e:
+            log.error("Failed to ensure sync DB/tables: %s", e)
+            raise
 
 if __name__ == "__main__":
     """This section is used to test tsdb.py."""
@@ -200,7 +264,7 @@ if __name__ == "__main__":
     except IOError as e:
         exit("Unable to open configuration file: %s" % e)
 
-    print("Using configuration file %s" % config_path)
+    log.info("Using configuration file %s", config_path)
 
     # Set logging configuration:
     weeutil.logger.setup('timescaledb', config_dict)
