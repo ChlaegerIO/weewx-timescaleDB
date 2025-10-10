@@ -4,12 +4,12 @@ Copyright 2025 Timo Kleger
 
 Distributed under terms of the GPLv3
 
-===============================================================================
+===========================================================================
 
 This Weewx driver plugin synchronizes data from the Weewx database to a postgres / TimescaleDB database locally on the device. Every new record is added to the tsdb, as well as not yet synchronized older records. In the initialization of the tsdb class one can change the disired columns that should be synchronized.
 
 
-===============================================================================
+===========================================================================
 
 ### Pre-Requisites 
 
@@ -26,7 +26,7 @@ sudo apt install timescaledb-2-postgresql-17 postgresql-client-17
 Optional: Install Grafana for Visualization
 
 
-===============================================================================
+===========================================================================
 
 ### Installation
 
