@@ -2,13 +2,23 @@ weewx-tsdb
 Copyright 2025 Timo Kleger
 Distributed under terms of the GPLv3
 
-This is a driver for weewx that syncs data from sqlite to postgres database.
+This Weewx driver plugin synchronizes data from the Weewx database to a postgres / TimescaleDB database locally on the device.
 
 
 ===============================================================================
-Hardware
+Pre-Requisites 
 
-Raspberry pi, it is tested with raspberry pi 5 and a SSD hat with 512 GB
+Install the [TimescaleDB](https://docs.tigerdata.com/self-hosted/latest/install/installation-linux/) extension for postgres
+```bash
+sudo apt install gnupg postgresql-common apt-transport-https lsb-release wget
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+echo "deb https://packagecloud.io/timescale/timescaledb/debian/ $(lsb_release -c -s) main" | sudo tee /etc/apt/sources.list.d/timescaledb.list
+wget --quiet -O - https://packagecloud.io/timescale/timescaledb/gpgkey | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/timescaledb.gpg
+sudo apt update
+sudo apt install timescaledb-2-postgresql-17 postgresql-client-17
+```
+
+Optional: Install Grafana for Visualization
 
 
 ===============================================================================
@@ -35,92 +45,19 @@ export WEEWX_BINDIR=/usr/share/weewx
 export WEEWX_USRDIR=/etc/weewx/bin/user
 PYTHONPATH=$WEEWX_BINDIR python3 $WEEWX_USRDIR/tsdb.py
 
-4) modify the [TSDB] section of weewx.conf using a text editor
+4) Add or modify the [TimescaleDBSync] section in weewx.conf
 
-- 
+[TimescaleDBSync]
+    
+    # Configuration
+    host = localhost
+    port = 5432
+    database = weather_data
+    user = postgres
+    password = password
+    enable_daily_sync = true
 
 5) start weewx
 
 sudo systemctl start weewx
 
-
-===============================================================================
-How to run the driver directly
-
-You can run the driver directly for testing, diagnostics, and development.  In
-fact, you can run the driver without installing it - just invoke python on it!
-In the examples elsewhere in this file, you will see this illustrated with the
-generic form, which is:
-
-  python3 tsdb.py
-
-However, in most cases you must specify the location of the WeeWX modules using
-PYTHONPATH.  So that generic form will become something like this:
-
-  PYTHONPATH=/path/to/weewx/modules python3 tsdb.py
-
-For example, a deb/rpm installation would look like this:
-
-  PYTHONPATH=/usr/share/weewx python3 /etc/weewx/bin/user/tsdb.py
-
-A pip/venv installation would look something like this:
-
-  PYTHONPATH=~/weewx-env python3 ~/weewx-data/bin/user/tsdb.py
-
-Note:
-You might have use 'sudo' if the user does not have permission to read/write
-the USB TSDB device.
-
-
-===============================================================================
-Configuration - 
-
-Use the [TSDB] section of the weewx configuration file (nominally weewx.conf) to
-adjust the driver configuration.
-
-  python3 tsdb.py
-
-Here are some configuration examples:
-
-# collect data from Acurite 5n1 sensor 0BFA and t/h sensor 24A4
-[TSDB]
-    driver = user.tsdb
-    
-
-
-===============================================================================
-Configuration - logging
-
-If you turn on debug=1, you will see a bewildering output from the TSDB driver.
-Although this is really helpful when debugging and diagnosing problems, often
-you want far less information.  There are a few logging options to help you
-control this beast.
-
-[TSDB]
-    driver = user.tsdb
-    log_lines = (True | False)
-    log_unknown_sensors = (True | False)
-    log_unmapped_sensors = (True | False)
-    log_packets = (True | False)             # only applies with debug=1
-    log_duplicate_readings = (True | False)  # only applies with debug=1
-
-
-===============================================================================
-How to diagnose problems
-
-TODO
-
-python3 tsdb.py
-
-
-in shell 1:
-cd /home/weewx
-sudo ./bin/weewxd weewx.conf
-
-in shell 2:
-tail -f /var/log/syslog
-
-Once you are satisfied with the output when running weewx directly, run weewx
-as a daemon and configure rc script or systemd to run weewx at system startup.
-
-sudo systemctl start weewx
