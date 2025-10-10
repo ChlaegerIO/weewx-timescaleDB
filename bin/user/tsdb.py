@@ -47,7 +47,9 @@ class TimescaleDBSync(StdService):
             "luminosity", "maxSolarRad", "nh3", "no2", "noise", "o3", "outHumidity", "outTemp", "pb", "pm10", 
             "pm1", "pm2_5", "pressure", "radiation", "rain", "rainRate", "rxCheckPercent", "snow", "snowDepth", 
             "snowMoisture", "snowRate", "so2", "soilMoist1", "soilMoist2", "soilTemp1", "soilTemp2", 
-            "txBatteryStatus", "uv", "windChill", "windDir", "windGust", "windGustDir", "windRun", "windSpeed"
+            "txBatteryStatus", "uv", "windChill", "windDir", "windGust", "windGustDir", "windRun", "windSpeed",
+            "highOutTemp", "lowOutTemp", "forecastRule", "windSpeed10", "dayRain", "monthRain", "yearRain", 
+            "stormRain", "dayET", "monthET", "yearET", "forecastIcon", "sunrise", "sunset", "wind_samples"
         ]
         
         # Get configuration
@@ -76,12 +78,10 @@ class TimescaleDBSync(StdService):
             self.sync_db_path = f"/var/lib/weewx/syncTsdb.sdb"
             # Initialize synchronization DB and postgres ts database
             self._init_sync_db()
-            log.info(f"Initialized TimescaleDB extension with sync info at {self.sync_db_path}")
         except Exception as e:
-            log.error(f"Error preparing sync DB: {e}")
+            log.error(f"Error initialization: {e}")
         else:
             self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
-            log.info("TimescaleDB database: %s", self.database)
 
     def new_archive_record(self, event):
         """Gets called on a new archive record event."""
@@ -91,13 +91,7 @@ class TimescaleDBSync(StdService):
         try:
             self.tsdb_conn = psycopg2.connect(**self.tsdb_config)
             self._insert_tsdb("archive", record)
-        except Exception as e:
-            log.error(f"Error connecting and synchronizing to TimescaleDB: %s", e)
-        finally:
-            if hasattr(self, 'tsdb_conn'):
-                self.tsdb_conn.close()
-        # Mark this new record as synced in the sync DB
-        try:
+            # Mark this new record as synced in the sync DB
             sconn = sqlite3.connect(self.sync_db_path)
             scur = sconn.cursor()
             scur.execute("INSERT OR REPLACE INTO synced_archive (dateTime, synced) VALUES (?, 1)", (record.get('dateTime'),))
@@ -105,7 +99,10 @@ class TimescaleDBSync(StdService):
             scur.close()
             sconn.close()
         except Exception as e:
-            log.error("Failed to mark archive record as synced in sync DB: %s", e)
+            log.error(f"Error synchronizing TimescaleDB archive: %s", e)
+        finally:
+            if hasattr(self, 'tsdb_conn'):
+                self.tsdb_conn.close()
 
         # Check for older records in the weewx database that haven't been synchronized yet
         try:
@@ -137,7 +134,7 @@ class TimescaleDBSync(StdService):
                 finally:
                     if hasattr(self, 'tsdb_conn'):
                         self.tsdb_conn.close()
-                # Mark as synced in sync DB
+                # Mark as synced in,  sync DB
                 sconn = sqlite3.connect(self.sync_db_path)
                 scur = sconn.cursor()
                 scur.execute("INSERT OR REPLACE INTO synced_archive (dateTime, synced) VALUES (?, 1)", (dt,))
@@ -159,21 +156,26 @@ class TimescaleDBSync(StdService):
     def _insert_tsdb(self, table, record):
         cur = self.tsdb_conn.cursor()
         try:
+            # Log the keys we're receiving
+            # log.info(f"Record keys for table {table}: {list(record.keys())}")
+            
             # Create table if it does not exist
             col_defs = ', '.join([f'{col} DOUBLE PRECISION' if col != 'dateTime' else 'dateTime INTEGER PRIMARY KEY' for col in record.keys()])
             create_sql = f"CREATE TABLE IF NOT EXISTS {table} ({col_defs})"
             cur.execute(create_sql)
             self.tsdb_conn.commit()
 
-            columns = ','.join(record.keys())
-            placeholders = ','.join(['%s'] * len(record))
-            values = tuple(record.values())
+            filtered_columns = [col for col in record.keys() if col in self.archive_columns or col in ['dateTime', 'usUnits', 'interval']]
+            filtered_record = {col: record[col] for col in filtered_columns}
+            columns = ','.join(filtered_record.keys())
+            placeholders = ','.join(['%s'] * len(filtered_record))
+            values = tuple(filtered_record.values())
             insert_sql = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
             cur.execute(insert_sql, values)
             self.tsdb_conn.commit()
             log.info(f"Inserted data into TimescaleDB {table} at time {record.get('dateTime')}")
         except Exception as e:
-            log.error("Error inserting record into TimescaleDB: %s", e)
+            log.error("Error inserting record into TimescaleDB %s: %s", table, e)
         finally:
             cur.close()
 
@@ -247,7 +249,7 @@ class TimescaleDBSync(StdService):
             conn.commit()
             cur.close()
             conn.close()
-            log.info("Sync DB ensured at %s", self.sync_db_path)
+            log.info("Synchronization database at %s", self.sync_db_path)
         except Exception as e:
             log.error("Failed to ensure sync DB/tables: %s", e)
         
@@ -339,7 +341,7 @@ class TimescaleDBSync(StdService):
             tsdb_conn.close()
             log.info("Completed TimescaleDB initialization")
         except Exception as e:
-            log.error(f"Failed to ensure TimescaleDB database: {e}")
+            log.error(f"Failed to initialize TimescaleDB database: {e}")
 
 if __name__ == "__main__":
     """This section is used to test tsdb.py."""
