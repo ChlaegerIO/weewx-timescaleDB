@@ -106,41 +106,52 @@ class TimescaleDBSync(StdService):
 
         # Check for older records in the weewx database that haven't been synchronized yet
         try:
-            sconn = sqlite3.connect(self.sync_db_path)
-            scur = sconn.cursor()
-            scur.execute("SELECT dateTime FROM synced_archive WHERE synced = 1")
-            synced_set = set(r[0] for r in scur.fetchall())
-            scur.close()
-            sconn.close()
-
             self.weewx_conn = sqlite3.connect(self.weewx_db_path)
             cursor = self.weewx_conn.cursor()
-            cursor.execute("SELECT * FROM archive ORDER BY dateTime ASC")
+
+            # Attach sync database to allow cross-database queries
+            cursor.execute(f"ATTACH DATABASE '{self.sync_db_path}' AS sync_db")
+
+            # Select only records that are NOT in the synced_archive table
+            # This avoids loading the entire archive table into memory
+            cursor.execute("""
+                SELECT * FROM archive 
+                WHERE dateTime NOT IN (SELECT dateTime FROM sync_db.synced_archive WHERE synced = 1)
+                ORDER BY dateTime ASC
+            """)
             rows = cursor.fetchall()
-            columns = [description[0] for description in cursor.description]
-            # filter columns that we want to insert
-            filtered_columns = [col for col in columns if col in self.archive_columns]
-            for row in rows:
-                filtered_row = [row[columns.index(col)] for col in filtered_columns]
-                dt = filtered_row[filtered_columns.index('dateTime')]
-                if dt in synced_set:
-                    continue
-                old_record = dict(zip(filtered_columns, filtered_row))
+
+            if rows:
+                columns = [description[0] for description in cursor.description]
+                # filter columns that we want to insert
+                filtered_columns = [col for col in columns if col in self.archive_columns]
+
+                # Open connections once for the batch
                 try:
                     self.tsdb_conn = psycopg2.connect(**self.tsdb_config)
-                    self._insert_tsdb("archive", old_record)
+                    sconn = sqlite3.connect(self.sync_db_path)
+                    scur = sconn.cursor()
+                    for row in rows:
+                        filtered_row = [row[columns.index(col)] for col in filtered_columns]
+                        old_record = dict(zip(filtered_columns, filtered_row))
+                        dt = old_record['dateTime']
+
+                        try:
+                            self._insert_tsdb("archive", old_record)
+                            # Mark as synced in sync DB
+                            scur.execute("INSERT OR REPLACE INTO synced_archive (dateTime, synced) VALUES (?, 1)", (dt,))
+                        except Exception as e:
+                            log.error(f"Error syncing older record {dt} to TimescaleDB: %s", e)
+
+                    sconn.commit()
+                    scur.close()
+                    sconn.close()
                 except Exception as e:
-                    log.error(f"Error syncing older values to TimescaleDB: %s", e)
+                    log.error(f"Error during batch sync to TimescaleDB: %s", e)
                 finally:
                     if hasattr(self, 'tsdb_conn'):
                         self.tsdb_conn.close()
-                # Mark as synced in,  sync DB
-                sconn = sqlite3.connect(self.sync_db_path)
-                scur = sconn.cursor()
-                scur.execute("INSERT OR REPLACE INTO synced_archive (dateTime, synced) VALUES (?, 1)", (dt,))
-                sconn.commit()
-                scur.close()
-                sconn.close()
+
         except Exception as e:
             log.error(f"Error synchronizing old records: %s", e)
         finally:
@@ -181,49 +192,54 @@ class TimescaleDBSync(StdService):
 
     def _sync_daily_archives(self):
         """Synchronize daily archives from WeeWX to TimescaleDB."""
-        try:
-            # For daily archives we keep a shared sync table (synced_archive_day)
-            sconn = sqlite3.connect(self.sync_db_path)
-            scur = sconn.cursor()
-            scur.execute("SELECT dateTime FROM synced_archive_day WHERE synced = 1")
-            synced_set = set(r[0] for r in scur.fetchall())
-            scur.close()
-            sconn.close()
-        except Exception as e:
-            log.error(f"Error reading synced database for daily archives: {e}")
-
         for measurements in self.daily_archive_tables:
             try:
                 self.weewx_conn = sqlite3.connect(self.weewx_db_path)
                 cursor = self.weewx_conn.cursor()
-                cursor.execute(f"SELECT * FROM {measurements} ORDER BY dateTime ASC")
+
+                # Attach sync database
+                cursor.execute(f"ATTACH DATABASE '{self.sync_db_path}' AS sync_db")
+
+                # Select records not in synced_archive_day
+                cursor.execute(f"""
+                    SELECT * FROM {measurements} 
+                    WHERE dateTime NOT IN (SELECT dateTime FROM sync_db.synced_archive_day WHERE synced = 1)
+                    ORDER BY dateTime ASC
+                """)
                 rows = cursor.fetchall()
-                columns = [description[0] for description in cursor.description]
-                for row in rows:
-                    dt = row[columns.index('dateTime')]
-                    if dt in synced_set:
-                        continue
-                    daily_record = dict(zip(columns, row))
+
+                if rows:
+                    columns = [description[0] for description in cursor.description]
+
                     try:
                         self.tsdb_conn = psycopg2.connect(**self.tsdb_config)
-                        self._insert_tsdb(measurements, daily_record)
+                        sconn = sqlite3.connect(self.sync_db_path)
+                        scur = sconn.cursor()
+                        for row in rows:
+                            daily_record = dict(zip(columns, row))
+                            dt = daily_record['dateTime']
+                            
+                            try:
+                                self._insert_tsdb(measurements, daily_record)
+                                # Mark day as synced
+                                scur.execute("INSERT OR REPLACE INTO synced_archive_day (dateTime, synced) VALUES (?, 1)", (dt,))
+                            except Exception as e:
+                                log.error(f"Error syncing daily record {dt} from {measurements}: {e}")
+                        
+                        sconn.commit()
+                        scur.close()
+                        sconn.close()
+                    except Exception as e:
+                        log.error(f"Error during batch sync for {measurements}: {e}")
                     finally:
                         if hasattr(self, 'tsdb_conn'):
                             self.tsdb_conn.close()
-                    # Mark day as synced (this marks the dateTime for all daily tables)
-                    sconn = sqlite3.connect(self.sync_db_path)
-                    scur = sconn.cursor()
-                    scur.execute("INSERT OR REPLACE INTO synced_archive_day (dateTime, synced) VALUES (?, 1)", (dt,))
-                    sconn.commit()
-                    scur.close()
-                    sconn.close()
+
             except Exception as e:
                 log.error(f"Error synchronizing daily archives from {measurements}: {e}")
             finally:
                 if hasattr(self, 'weewx_conn'):
                     self.weewx_conn.close()
-                if hasattr(self, 'tsdb_conn'):
-                    self.tsdb_conn.close()
 
     def _init_sync_db(self):
         """Create the sync DB file and required tables if they do not exist."""
